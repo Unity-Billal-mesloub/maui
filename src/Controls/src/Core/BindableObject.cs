@@ -6,6 +6,7 @@ using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Maui.Controls.Internals;
 using Microsoft.Maui.Dispatching;
@@ -38,8 +39,8 @@ namespace Microsoft.Maui.Controls
 		}
 
 		internal ushort _triggerCount = 0;
-		internal Dictionary<TriggerBase, SetterSpecificity> _triggerSpecificity = new Dictionary<TriggerBase, SetterSpecificity>();
-		readonly Dictionary<BindableProperty, BindablePropertyContext> _properties = new Dictionary<BindableProperty, BindablePropertyContext>(4);
+		internal Dictionary<TriggerBase, SetterSpecificity> _triggerSpecificity = new();
+		readonly Dictionary<int, BindablePropertyContext> _properties = new(4);
 		bool _applying;
 		WeakReference _inheritedContext;
 
@@ -86,7 +87,7 @@ namespace Microsoft.Maui.Controls
 
 			if (property.IsReadOnly)
 			{
-				Application.Current?.FindMauiContext()?.CreateLogger<BindableObject>()?.LogWarning($"Cannot set the BindableProperty \"{property.PropertyName}\" because it is readonly.");
+				MauiLogger<BindableObject>.Log(LogLevel.Warning, $"Cannot set the BindableProperty \"{property.PropertyName}\" because it is readonly.");
 				return;
 			}
 
@@ -100,7 +101,7 @@ namespace Microsoft.Maui.Controls
 
 			if (property.IsReadOnly)
 			{
-				Application.Current?.FindMauiContext()?.CreateLogger<BindableObject>()?.LogWarning($"Cannot set the BindableProperty \"{property.PropertyName}\" because it is readonly.");
+				MauiLogger<BindableObject>.Log(LogLevel.Warning, $"Cannot set the BindableProperty \"{property.PropertyName}\" because it is readonly.");
 				return;
 			}
 
@@ -172,12 +173,13 @@ namespace Microsoft.Maui.Controls
 			return context == null ? property.DefaultValue : context.Values.GetValue();
 		}
 
+		// Used by Visual Studio Live Property Explorer via reflection; do not remove without coordinating with VS.
 		internal LocalValueEnumerator GetLocalValueEnumerator() => new LocalValueEnumerator(this);
 
 		internal sealed class LocalValueEnumerator : IEnumerator<LocalValueEntry>
 		{
-			Dictionary<BindableProperty, BindablePropertyContext>.Enumerator _propertiesEnumerator;
-			internal LocalValueEnumerator(BindableObject bindableObject) => _propertiesEnumerator = bindableObject._properties.GetEnumerator();
+			Dictionary<int, BindablePropertyContext>.ValueCollection.Enumerator _propertiesEnumerator;
+			internal LocalValueEnumerator(BindableObject bindableObject) => _propertiesEnumerator = bindableObject._properties.Values.GetEnumerator();
 
 			object IEnumerator.Current => Current;
 			public LocalValueEntry Current { get; private set; }
@@ -186,7 +188,8 @@ namespace Microsoft.Maui.Controls
 			{
 				if (_propertiesEnumerator.MoveNext())
 				{
-					Current = new LocalValueEntry(_propertiesEnumerator.Current.Key, _propertiesEnumerator.Current.Value.Values.GetValue(), _propertiesEnumerator.Current.Value.Attributes);
+					var context = _propertiesEnumerator.Current;
+					Current = new LocalValueEntry(context.Property, context.Values.GetValue(), context.Attributes);
 					return true;
 				}
 				return false;
@@ -217,21 +220,17 @@ namespace Microsoft.Maui.Controls
 
 		internal (bool IsSet, T Value)[] GetValues<T>(BindableProperty[] propArray)
 		{
-			Dictionary<BindableProperty, BindablePropertyContext> properties = _properties;
+			var properties = _properties;
 			var resultArray = new (bool IsSet, T Value)[propArray.Length];
 
 			for (int i = 0; i < propArray.Length; i++)
 			{
-				if (properties.TryGetValue(propArray[i], out var context))
+				ref var result = ref resultArray[i];
+				if (properties.TryGetValue(propArray[i].InternalId, out var context))
 				{
 					var pair = context.Values.GetSpecificityAndValue();
-					resultArray[i].IsSet = pair.Key != SetterSpecificity.DefaultValue;
-					resultArray[i].Value = (T)pair.Value;
-				}
-				else
-				{
-					resultArray[i].IsSet = false;
-					resultArray[i].Value = default(T);
+					result.IsSet = pair.Key != SetterSpecificity.DefaultValue;
+					result.Value = (T)pair.Value;
 				}
 			}
 
@@ -252,6 +251,19 @@ namespace Microsoft.Maui.Controls
 			if ((bpcontext.Attributes & BindableContextAttributes.IsDefaultValueCreated) == BindableContextAttributes.IsDefaultValueCreated)
 				return true;
 			return bpcontext.Values.GetSpecificity() != SetterSpecificity.DefaultValue;
+		}
+
+		/// <summary>
+		/// Determines whether a bindable property has been set by a local value, style, binding, or other non-default specificity.
+		/// Unlike IsSet, default-value creation does not count as explicit.
+		/// </summary>
+		/// <param name="targetProperty">The bindable property to check if a value is explicitly set.</param>
+		/// <returns><see langword="true"/> if the target property exists and has been explicitly set. Otherwise <see langword="false"/>.</returns>
+		/// <exception cref="ArgumentNullException">Thrown when <paramref name="targetProperty"/> is <see langword="null"/>.</exception>
+		internal bool IsSetExplicitly(BindableProperty targetProperty)
+		{
+			var bpcontext = GetContext(targetProperty ?? throw new ArgumentNullException(nameof(targetProperty)));
+			return bpcontext is not null && bpcontext.Values.GetSpecificity() != SetterSpecificity.DefaultValue;
 		}
 
 
@@ -295,7 +307,7 @@ namespace Microsoft.Maui.Controls
 
 			if (targetProperty.IsReadOnly && binding.Mode == BindingMode.OneWay)
 			{
-				Application.Current?.FindMauiContext()?.CreateLogger<BindableObject>()?.LogWarning($"Cannot set the a OneWay Binding \"{targetProperty.PropertyName}\" because it is readonly.");
+				MauiLogger<BindableObject>.Log(LogLevel.Warning, $"Cannot set the a OneWay Binding \"{targetProperty.PropertyName}\" because it is readonly.");
 				return;
 			}
 
@@ -308,7 +320,19 @@ namespace Microsoft.Maui.Controls
 				var currentValue = context.Values.GetValue();
 
 				context.Values.Remove(currentSpecificity);
-				context.Values[SetterSpecificity.FromBinding] = currentValue;
+				// Also remove any ManualValueSetter entries that might interfere with binding value comparison.
+				// This fixes issue #29459 where switching bindings didn't trigger propertyChanged.
+				//
+				// Intentional trade-off: if a higher-priority setter (e.g. Trigger, VisualStateSetter) was
+				// the active specificity while a ManualValueSetter entry also existed, both are cleaned up
+				// here. The manual fallback value is discarded when switching bindings. This is acceptable
+				// because keeping stale TwoWay write-back values would silently suppress propertyChanged
+				// notifications on subsequent binding switches, which is the original bug.
+				if (currentSpecificity != SetterSpecificity.ManualValueSetter)
+				{
+					context.Values.Remove(SetterSpecificity.ManualValueSetter);
+				}
+				context.Values.SetValue(SetterSpecificity.FromBinding, currentValue);
 			}
 
 			BindingBase oldBinding = null;
@@ -322,13 +346,13 @@ namespace Microsoft.Maui.Controls
 
 			if (oldBinding != null && specificity < oldSpecificity)
 			{
-				context.Bindings[specificity] = binding;
+				context.Bindings.SetValue(specificity, binding);
 				return;
 			}
 
 			oldBinding?.Unapply();
 
-			context.Bindings[specificity] = binding ?? throw new ArgumentNullException(nameof(binding));
+			context.Bindings.SetValue(specificity, binding ?? throw new ArgumentNullException(nameof(binding)));
 
 			targetProperty.BindingChanging?.Invoke(this, oldBinding, binding);
 
@@ -503,7 +527,7 @@ namespace Microsoft.Maui.Controls
 
 			if (property.IsReadOnly)
 			{
-				Application.Current?.FindMauiContext()?.CreateLogger<BindableObject>()?.LogWarning($"Cannot set the BindableProperty \"{property.PropertyName}\" because it is readonly.");
+				MauiLogger<BindableObject>.Log(LogLevel.Warning, $"Cannot set the BindableProperty \"{property.PropertyName}\" because it is readonly.");
 				return;
 			}
 			SetValueCore(property, value, SetValueFlags.ClearOneWayBindings | SetValueFlags.ClearDynamicResource, SetValuePrivateFlags.Default, SetterSpecificity.ManualValueSetter);
@@ -531,7 +555,7 @@ namespace Microsoft.Maui.Controls
 
 			if (property.IsReadOnly)
 			{
-				Application.Current?.FindMauiContext()?.CreateLogger<BindableObject>()?.LogWarning($"Cannot set the BindableProperty \"{property.PropertyName}\" because it is readonly.");
+				MauiLogger<BindableObject>.Log(LogLevel.Warning, $"Cannot set the BindableProperty \"{property.PropertyName}\" because it is readonly.");
 				return;
 			}
 
@@ -572,13 +596,13 @@ namespace Microsoft.Maui.Controls
 
 			if (!converted && !property.TryConvert(ref value))
 			{
-				Application.Current?.FindMauiContext()?.CreateLogger<BindableObject>()?.LogWarning($"Cannot convert {value} to type '{property.ReturnType}'");
+				MauiLogger<BindableObject>.Log(LogLevel.Warning, $"Cannot convert {value} to type '{property.ReturnType}'");
 				return;
 			}
 
 			if (property.ValidateValue != null && !property.ValidateValue(this, value))
 			{
-				Application.Current?.FindMauiContext()?.CreateLogger<BindableObject>()?.LogWarning($"Value is an invalid value for {property.PropertyName}");
+				MauiLogger<BindableObject>.Log(LogLevel.Warning, $"Value is an invalid value for {property.PropertyName}");
 				return;
 			}
 
@@ -637,7 +661,7 @@ namespace Microsoft.Maui.Controls
 			//We keep setter of lower specificity so we can unapply
 			if (specificity < originalSpecificity)
 			{
-				context.Values[specificity] = value;
+				context.Values.SetValue(specificity, value);
 				return;
 			}
 
@@ -655,7 +679,7 @@ namespace Microsoft.Maui.Controls
 				OnPropertyChanging(property.PropertyName);
 			}
 
-			context.Values[specificity] = value;
+			context.Values.SetValue(specificity, value);
 
 			context.Attributes &= ~BindableContextAttributes.IsDefaultValueCreated;
 
@@ -749,24 +773,35 @@ namespace Microsoft.Maui.Controls
 		}
 
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		BindablePropertyContext CreateAndAddContext(BindableProperty property)
+		BindablePropertyContext CreateContext(BindableProperty property)
 		{
 			var defaultValueCreator = property.DefaultValueCreator;
 			var context = new BindablePropertyContext { Property = property };
-			context.Values[SetterSpecificity.DefaultValue] = defaultValueCreator != null ? defaultValueCreator(this) : property.DefaultValue;
+			context.Values.SetValue(SetterSpecificity.DefaultValue, defaultValueCreator != null ? defaultValueCreator(this) : property.DefaultValue);
 
 			if (defaultValueCreator != null)
 				context.Attributes = BindableContextAttributes.IsDefaultValueCreated;
 
-			_properties.Add(property, context);
 			return context;
 		}
 
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		internal BindablePropertyContext GetContext(BindableProperty property) => _properties.TryGetValue(property, out var result) ? result : null;
+		internal BindablePropertyContext GetContext(BindableProperty property) => _properties.TryGetValue(property.InternalId, out var result) ? result : null;
 
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		BindablePropertyContext GetOrCreateContext(BindableProperty property) => GetContext(property) ?? CreateAndAddContext(property);
+		BindablePropertyContext GetOrCreateContext(BindableProperty property)
+		{
+			if (_properties.TryGetValue(property.InternalId, out var context))
+				return context;
+
+			// Do not use CollectionsMarshal.GetValueRefOrAddDefault: CreateContext invokes
+			// DefaultValueCreator, which is arbitrary user code and may mutate other
+			// BindableProperties, resizing _properties and invalidating the returned ref.
+			// See dotnet/maui#36744.
+			context = CreateContext(property);
+			_properties[property.InternalId] = context;
+			return context;
+		}
 
 		void RemoveBinding(BindableProperty property, BindablePropertyContext context, SetterSpecificity specificity)
 		{
@@ -776,7 +811,7 @@ namespace Microsoft.Maui.Controls
 				return; //used to fail;
 
 			var currentbinding = context.Bindings.GetValue();
-			var binding = context.Bindings[specificity];
+			var binding = context.Bindings.GetValue(specificity);
 			var isCurrent = binding == currentbinding;
 
 			if (isCurrent)
@@ -857,11 +892,11 @@ namespace Microsoft.Maui.Controls
 		{
 			public BindableContextAttributes Attributes;
 
-			public SetterSpecificityList<BindingBase> Bindings = new();
+			public SetterSpecificityList<BindingBase> Bindings;
 
 			public Queue<SetValueArgs> DelayedSetters;
 			public BindableProperty Property;
-			public readonly SetterSpecificityList<object> Values = new(3);
+			public SetterSpecificityList<object> Values;
 		}
 
 
